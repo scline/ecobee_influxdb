@@ -20,6 +20,7 @@ import requests
 import json
 import pytz
 import sys
+import os
 from pathlib import Path
 import logging
 import logging.handlers
@@ -30,18 +31,20 @@ days_of_logs_to_keep = 7
 # set to DEBUG, INFO, ERROR, etc
 logging_level = 'DEBUG'
 #ecobee API Key
-APIKey = "YOUR_API_KEY"
+APIKey = os.getenv('API_KEY', "YOUR_API_KEY")
 #influxDB info
-influxdb_server = '192.168.1.2'
-influxdb_port = 8086
-influxdb_database = 'ecobee'
+influxdb_server = os.getenv('INFLUXDB_SERVER', '192.168.1.2')
+influxdb_port = os.getenv('INFLUXDB_PORT', 8086)
+influxdb_database = os.getenv('INFLUXDB_DATABASE', 'ecobee')
 #runtime report time since last report query
-runtime_difference = 60
+runtime_difference = int(os.getenv('RUNTIME_DIFF', 60))
 
 #setup logger
 logger = logging.getLogger('ecobee')
 logger.setLevel(getattr(logging, logging_level))
 handler = logging.handlers.TimedRotatingFileHandler(log_file_path, when="d", interval=1,  backupCount=days_of_logs_to_keep)
+if os.getenv('DOCKER', False):
+    handler = logging.StreamHandler(sys.stdout)
 formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 handler.setFormatter(formatter)
 logger.addHandler(handler)
@@ -77,6 +80,12 @@ def api_request(url, method, header=''):
 #access token needs to be refreshed at least every hour
 # get refresh code from file
 token_file = str(Path.home()) + '/.ecobee_refresh_token'
+
+# validate token file exists, otherwise create it
+if not os.path.isfile(token_file):
+    with open(token_file, 'w+') as f:
+        f.write(os.getenv('REFRESH_CODE', 'MISSING_TOKEN'))
+
 with open(token_file) as f:
     refreshToken = f.readline().replace("\n","")
 
@@ -159,8 +168,6 @@ for thermostat in response['thermostatList']:
             if capability['type'] == 'humidity':
                 points.append(logPoint(sensorName=sensor['name'], thermostatName=str(thermostatName), sensorValue=float(capability['value']), sensorType="humidity"))
 
-
-
     runtime = thermostat['runtime']
     temp = int(runtime['actualTemperature']) / 10
     heatTemp = int(runtime['desiredHeat']) / 10
@@ -214,11 +221,16 @@ for thermostat in response['thermostatList']:
     #  the server it doesn't help to query the data again until ~10:45
     query = client.query("SELECT * FROM fantime WHERE sensor='" + thermostatName + "' ORDER BY DESC LIMIT 1")
     query_response = list(query.get_points())
-    response_time_stamp = datetime.datetime.strptime(query_response[0]['time'], '%Y-%m-%dT%H:%M:%SZ')
-    difference_minutes = (datetime.datetime.now() - response_time_stamp).seconds / 60
-
-    logger.info("last runtime report timestamp from query for " + thermostatName + ": " + response_time_stamp.strftime("%Y-%m-%d %H:%M:%S"))
-    logger.debug("difference in minutes: " + str(difference_minutes))
+    #first run will error as no data exsists in influxdb, this catches and places a fake value of 24 hours in the past.
+    try:
+        response_time_stamp = datetime.datetime.strptime(query_response[0]['time'], '%Y-%m-%dT%H:%M:%SZ')
+        difference_minutes = (datetime.datetime.now() - response_time_stamp).seconds / 60
+        logger.info("last runtime report timestamp from query for " + thermostatName + ": " + response_time_stamp.strftime("%Y-%m-%d %H:%M:%S"))
+        logger.debug("difference in minutes: " + str(difference_minutes))
+    except:
+        logger.debug("Error reading response_time_stamp, running as if 24 hours in the past...")
+        response_time_stamp = datetime.datetime.now() - datetime.timedelta(days=1)
+        difference_minutes = runtime_difference + 1
 
     if runtime_difference < difference_minutes:
 
@@ -241,7 +253,11 @@ for thermostat in response['thermostatList']:
         data = api_request(url, 'get', headers)
 
         for row in data['reportList'][0]['rowList']:
-            myday,mytime,auxHeat1,compCool1,fan,outdoorTemp,zoneAveTemp,eol = row.split(",")
+            #logger.debug("Polled Data" + row)
+            try:
+                myday,mytime,auxHeat1,compCool1,fan,outdoorTemp,zoneAveTemp,eol = row.split(",")
+            except:
+                myday,mytime,auxHeat1,compCool1,fan,outdoorTemp,zoneAveTemp = row.split(",")
             date_str = str(myday) + " " + str(mytime)
             datetime_obj = datetime.datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S")
             builttime = datetime_obj.strftime ("%Y-%m-%d %H:%M:%S")
